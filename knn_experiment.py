@@ -72,6 +72,7 @@ def make_grid_geometry(n):
 
     return cell_lat_bounds, cell_lon_bounds, assign_cell
 
+
 def dlow_sq_for_cell(lat_q, lon_q, lat_min, lat_max, lon_min, lon_max):
     dx = 0.0
     if lat_q < lat_min:
@@ -315,6 +316,104 @@ def knn_grid_bf_inmemory(x, y, grid, k, n):
     ids = [str(item[1]) for item in res]
     return ", ".join(ids), cells_visited
 
+# ----------R-tree implementation (STR bulk-load + best-first kNN)----------
+
+class RTreeNode:
+    def __init__(self, is_leaf):
+        self.is_leaf = is_leaf
+        self.children = []  # for leaf: list of points(locid, lat, lon); for non-leaf: list of child nodes
+        self.mbr = None      # (minx, miny, maxx, maxy)
+
+def mbr_of_point(lat, lon):
+    return (lat, lon, lat, lon)
+
+def extend_mbr(mbr, other):
+    if mbr is None:
+        return other
+    minx = min(mbr[0], other[0])
+    miny = min(mbr[1], other[1])
+    maxx = max(mbr[2], other[2])
+    maxy = max(mbr[3], other[3])
+    return (minx, miny, maxx, maxy)
+
+def mbr_of_node(node):
+    m = None
+    if node.is_leaf:
+        for (locid, lat, lon) in node.children:
+            m = extend_mbr(m, mbr_of_point(lat, lon))
+    else:
+        for child in node.children:
+            m = extend_mbr(m, child.mbr)
+    node.mbr = m
+    return m
+
+def centroid_of_node(node):
+    # centroid of MBR
+    minx, miny, maxx, maxy = node.mbr
+    return ((minx + maxx) / 2.0, (miny + maxy) / 2.0)
+
+def build_rtree_str(data_list, leaf_capacity=32, node_capacity=32):
+    """
+    Build an R-tree using the STR (Sort-Tile-Recursive) bulk-load algorithm.
+    data_list: list of (lat, lon, locid)
+    leaf_capacity, node_capacity: max entries per node
+    Returns root node.
+    """
+    if not data_list:
+        root = RTreeNode(is_leaf=True)
+        root.mbr = None
+        return root
+
+    N = len(data_list)
+    # convert to (x=lat, y=lon, locid)
+    points = [(lat, lon, locid) for (lat, lon, locid) in data_list]
+
+    # Create leaf nodes:
+    L = leaf_capacity
+    S = int(math.ceil(N / L))                      # target number of leaf nodes
+    slice_count = int(math.ceil(math.sqrt(S)))     # number of vertical slices
+    if slice_count < 1:
+        slice_count = 1
+    points_sorted_x = sorted(points, key=lambda p: p[0])  # sort by x (lat)
+
+    leaves = []
+    slice_size = int(math.ceil(len(points_sorted_x) / slice_count))
+    idx = 0
+    while idx < len(points_sorted_x):
+        slice_block = points_sorted_x[idx: idx + slice_size]
+        idx += slice_size
+        # sort slice by y and pack into leaf nodes
+        slice_sorted_y = sorted(slice_block, key=lambda p: p[1])
+        j = 0
+        while j < len(slice_sorted_y):
+            group = slice_sorted_y[j: j + L]
+            j += L
+            leaf = RTreeNode(is_leaf=True)
+            # store as (locid, lat, lon) for consistency with grid leaf format
+            leaf.children = [(item[2], item[0], item[1]) for item in group]
+            mbr_of_node(leaf)
+            leaves.append(leaf)
+
+    # Build upper levels by packing children into nodes of capacity node_capacity
+    current_level = leaves
+    while len(current_level) > 1:
+        # sort nodes by centroid.x (lat)
+        current_level_sorted = sorted(current_level, key=lambda node: centroid_of_node(node)[0])
+        new_level = []
+        group_size = node_capacity
+        i = 0
+        while i < len(current_level_sorted):
+            group = current_level_sorted[i: i + group_size]
+            i += group_size
+            parent = RTreeNode(is_leaf=False)
+            parent.children = group
+            mbr_of_node(parent)
+            new_level.append(parent)
+        current_level = new_level
+
+    root = current_level[0]
+    return root
+
 def generate_queries(num_queries=100, seed=42, out_file=None):
     random.seed(seed)
     qs = []
@@ -360,6 +459,12 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
         queries = generate_queries(100, seed=42)
         print(f"Generated {len(queries)} deterministic queries (seed=42).")
 
+    # Build R-tree once
+    print("Building R-tree (STR bulk-load) ...", end="", flush=True)
+    # leaf/node capacities can be tuned
+    rtree_root = build_rtree_str(data_list, leaf_capacity=32, node_capacity=32)
+    print(" done.")
+
     ns = [10, 50, 100, 150, 200]
     k_fixed = 5
     exp1_results = []
@@ -377,6 +482,9 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
         grid_cells = []
         bf_times = []
         bf_cells = []
+        rtree_times = []
+        rtree_nodes = []
+        rtree_points = []
 
         for (qx, qy) in queries:
             t0 = time.perf_counter()
@@ -396,6 +504,14 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
             bf_times.append((t1 - t0) * 1000.0)
             bf_cells.append(cells_bf)
 
+            # R-tree best-first
+            t0 = time.perf_counter()
+            _, nodes_vis, pts_vis = knn_rtree_inmemory(qx, qy, rtree_root, k_fixed)
+            t1 = time.perf_counter()
+            rtree_times.append((t1 - t0) * 1000.0)
+            rtree_nodes.append(nodes_vis)
+            rtree_points.append(pts_vis)
+
         row = {
             "n": n,
             "linear_ms": avg(linear_times),
@@ -403,21 +519,24 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
             "grid_cells": avg(grid_cells),
             "bf_ms": avg(bf_times),
             "bf_cells": avg(bf_cells),
+            "rtree_ms": avg(rtree_times),
+            "rtree_nodes": avg(rtree_nodes),
+            "rtree_points": avg(rtree_points),
         }
         exp1_results.append(row)
-        print(f" n={n} done: linear {row['linear_ms']:.3f} ms, grid {row['grid_ms']:.3f} ms ({row['grid_cells']:.2f} cells), bf {row['bf_ms']:.3f} ms ({row['bf_cells']:.2f} cells)")
+        print(f" n={n} done: linear {row['linear_ms']:.3f} ms, grid {row['grid_ms']:.3f} ms ({row['grid_cells']:.2f} cells), bf {row['bf_ms']:.3f} ms ({row['bf_cells']:.2f} cells), rtree {row['rtree_ms']:.3f} ms")
 
     print("\nExperiment 1 results (avg over queries):")
-    print("n, linear_ms, knn_grid_ms, knn_grid_cells_avg, knn_grid_bf_ms, knn_grid_bf_cells_avg")
+    print("n, linear_ms, knn_grid_ms, knn_grid_cells_avg, knn_grid_bf_ms, knn_grid_bf_cells_avg, knn_rtree_ms, knn_rtree_nodes_avg, knn_rtree_points_avg")
     for r in exp1_results:
-        print(f"{r['n']}, {r['linear_ms']:.6f}, {r['grid_ms']:.6f}, {r['grid_cells']:.6f}, {r['bf_ms']:.6f}, {r['bf_cells']:.6f}")
+        print(f"{r['n']}, {r['linear_ms']:.6f}, {r['grid_ms']:.6f}, {r['grid_cells']:.6f}, {r['bf_ms']:.6f}, {r['bf_cells']:.6f}, {r['rtree_ms']:.6f}, {r['rtree_nodes']:.6f}, {r['rtree_points']:.6f}")
 
     if out_prefix:
         out1 = f"{out_prefix}_exp1.csv"
         with open(out1, "w", encoding="utf-8") as fout:
-            fout.write("n,linear_ms,knn_grid_ms,knn_grid_cells_avg,knn_grid_bf_ms,knn_grid_bf_cells_avg\n")
+            fout.write("n,linear_ms,knn_grid_ms,knn_grid_cells_avg,knn_grid_bf_ms,knn_grid_bf_cells_avg,knn_rtree_ms,knn_rtree_nodes_avg,knn_rtree_points_avg\n")
             for r in exp1_results:
-                fout.write(f"{r['n']},{r['linear_ms']},{r['grid_ms']},{r['grid_cells']},{r['bf_ms']},{r['bf_cells']}\n")
+                fout.write(f"{r['n']},{r['linear_ms']},{r['grid_ms']},{r['grid_cells']},{r['bf_ms']},{r['bf_cells']},{r['rtree_ms']},{r['rtree_nodes']},{r['rtree_points']}\n")
         print(f"Saved Experiment 1 results to {out1}")
 
     # Experiment 2: vary k for fixed n
@@ -436,6 +555,9 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
         grid_cells = []
         bf_times = []
         bf_cells = []
+        rtree_times = []
+        rtree_nodes = []
+        rtree_points = []
         for (qx, qy) in queries:
             t0 = time.perf_counter()
             _ = knn_linear_inmemory(qx, qy, data_list, k)
@@ -454,6 +576,15 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
             bf_times.append((t1 - t0) * 1000.0)
             bf_cells.append(cells_bf)
 
+            # R-tree
+            t0 = time.perf_counter()
+            _, nodes_vis, pts_vis = knn_rtree_inmemory(qx, qy, rtree_root, k)
+            t1 = time.perf_counter()
+            rtree_times.append((t1 - t0) * 1000.0)
+            rtree_nodes.append(nodes_vis)
+            rtree_points.append(pts_vis)
+
+
         row = {
             "k": k,
             "linear_ms": avg(linear_times),
@@ -461,21 +592,24 @@ def run_experiments(data_path_new, queries_file=None, out_prefix=None, index_tem
             "grid_cells": avg(grid_cells),
             "bf_ms": avg(bf_times),
             "bf_cells": avg(bf_cells),
+            "rtree_ms": avg(rtree_times),
+            "rtree_nodes": avg(rtree_nodes),
+            "rtree_points": avg(rtree_points),
         }
         exp2_results.append(row)
-        print(f" k={k} done: linear {row['linear_ms']:.3f} ms, grid {row['grid_ms']:.3f} ms ({row['grid_cells']:.2f} cells), bf {row['bf_ms']:.3f} ms ({row['bf_cells']:.2f} cells)")
+        print(f" k={k} done: linear {row['linear_ms']:.3f} ms, grid {row['grid_ms']:.3f} ms ({row['grid_cells']:.2f} cells), bf {row['bf_ms']:.3f} ms ({row['bf_cells']:.2f} cells), rtree {row['rtree_ms']:.3f} ms")
 
     print("\nExperiment 2 results (avg over queries):")
-    print("k, linear_ms, knn_grid_ms, knn_grid_cells_avg, knn_grid_bf_ms, knn_grid_bf_cells_avg")
+    print("k, linear_ms, knn_grid_ms, knn_grid_cells_avg, knn_grid_bf_ms, knn_grid_bf_cells_avg, knn_rtree_ms, knn_rtree_nodes_avg, knn_rtree_points_avg")
     for r in exp2_results:
-        print(f"{r['k']}, {r['linear_ms']:.6f}, {r['grid_ms']:.6f}, {r['grid_cells']:.6f}, {r['bf_ms']:.6f}, {r['bf_cells']:.6f}")
+        print(f"{r['k']}, {r['linear_ms']:.6f}, {r['grid_ms']:.6f}, {r['grid_cells']:.6f}, {r['bf_ms']:.6f}, {r['bf_cells']:.6f}, {r['rtree_ms']:.6f}, {r['rtree_nodes']:.6f}, {r['rtree_points']:.6f}")
 
     if out_prefix:
         out2 = f"{out_prefix}_exp2.csv"
         with open(out2, "w", encoding="utf-8") as fout:
-            fout.write("k,linear_ms,knn_grid_ms,knn_grid_cells_avg,knn_grid_bf_ms,knn_grid_bf_cells_avg\n")
+            fout.write("k,linear_ms,knn_grid_ms,knn_grid_cells_avg,knn_grid_bf_ms,knn_grid_bf_cells_avg,knn_rtree_ms,knn_rtree_nodes_avg,knn_rtree_points_avg\n")
             for r in exp2_results:
-                fout.write(f"{r['k']},{r['linear_ms']},{r['grid_ms']},{r['grid_cells']},{r['bf_ms']},{r['bf_cells']}\n")
+                fout.write(f"{r['k']},{r['linear_ms']},{r['grid_ms']},{r['grid_cells']},{r['bf_ms']},{r['bf_cells']},{r['rtree_ms']},{r['rtree_nodes']},{r['rtree_points']}\n")
         print(f"Saved Experiment 2 results to {out2}")
 
     print("\nExperiments complete.")
