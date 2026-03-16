@@ -10,6 +10,7 @@ import heapq
 import time
 import random
 import os
+import itertools
 
 # Bounding box constants
 X_MIN, X_MAX = -90.0, 90.0      # latitude range
@@ -413,6 +414,86 @@ def build_rtree_str(data_list, leaf_capacity=32, node_capacity=32):
 
     root = current_level[0]
     return root
+
+def dlow_sq_for_mbr(lat_q, lon_q, mbr):
+    if mbr is None:
+        return float("inf")
+    minx, miny, maxx, maxy = mbr
+    dx = 0.0
+    if lat_q < minx:
+        dx = minx - lat_q
+    elif lat_q > maxx:
+        dx = lat_q - maxx
+    dy = 0.0
+    if lon_q < miny:
+        dy = miny - lon_q
+    elif lon_q > maxy:
+        dy = lon_q - maxy
+    return dx * dx + dy * dy
+
+def knn_rtree_inmemory(x, y, rtree_root, k):
+    """
+    Best-first k-NN on R-tree.
+    Returns (ids_str, nodes_visited, points_visited).
+    nodes_visited: number of R-tree nodes popped (internal + leaf).
+    points_visited: number of data points whose distance was explicitly computed.
+    """
+    if k <= 0:
+        return "", 0, 0
+    
+    # PQ over nodes by dlow to their MBR
+    counter = itertools.count()  # Use a tie-breaker counter to avoid comparing node objects when dlow ties occur
+    cell_pq = []
+    root_d = dlow_sq_for_mbr(x, y, rtree_root.mbr)
+    heapq.heappush(cell_pq, (root_d, next(counter), rtree_root))
+    
+    heap = []  # candidate max-heap (negative dist)
+    nodes_visited = 0
+    points_visited = 0
+    
+    while cell_pq:
+        dlow_sq, _, node = heapq.heappop(cell_pq)
+        
+        # current threshold
+        if len(heap) < k:
+            t_sq = float("inf")
+        else:
+            t_sq = -heap[0][0]
+        
+        if dlow_sq > t_sq:
+            break
+        
+        nodes_visited += 1
+        
+        if node.is_leaf:
+            # check all entries
+            for (locid, plat, plon) in node.children:
+                dx = plat - x
+                dy = plon - y
+                dist_sq = dx * dx + dy * dy
+                points_visited += 1
+                
+                if len(heap) < k:
+                    heapq.heappush(heap, (-dist_sq, locid))
+                else:
+                    if dist_sq < -heap[0][0]:
+                        heapq.heapreplace(heap, (-dist_sq, locid))
+        else:
+            # push children with their lower bound
+            for child in node.children:
+                nd = dlow_sq_for_mbr(x, y, child.mbr)
+                heapq.heappush(cell_pq, (nd, next(counter), child))
+    
+    res = []
+    while heap:
+        negd, lid = heapq.heappop(heap)
+        res.append((-negd, lid))
+    res.sort(key=lambda item: item[0])
+    ids = [str(item[1]) for item in res]
+    return ", ".join(ids), nodes_visited, points_visited
+
+# -------------------- end R-tree implementation --------------------
+
 
 def generate_queries(num_queries=100, seed=42, out_file=None):
     random.seed(seed)
